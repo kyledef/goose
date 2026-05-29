@@ -674,6 +674,7 @@ macro_rules! tests_config_option_set_error {
         #[test_case::test_case("mode", "not_a_mode", None, agent_client_protocol::Error::invalid_params().data("Invalid mode: not_a_mode") ; "invalid mode via config option")]
         #[test_case::test_case("mode", "auto", Some("nonexistent-session-id"), agent_client_protocol::Error::resource_not_found(Some("nonexistent-session-id".to_string())).data("Session not found: nonexistent-session-id") ; "session not found via config option")]
         #[test_case::test_case("thought_level", "high", None, agent_client_protocol::Error::invalid_params().data("Unsupported config option: thought_level") ; "unsupported config option")]
+        #[test_case::test_case("thinking_effort", "invalid_value", None, agent_client_protocol::Error::invalid_params().data("unknown thinking effort: 'invalid_value'") ; "invalid thinking effort value")]
         fn test_config_option_set_error(
             config_id: &'static str,
             value: &'static str,

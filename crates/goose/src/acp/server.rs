@@ -1109,12 +1109,19 @@ async fn build_eager_config_from_inventory(
     inventory: &ProviderInventoryEntry,
     mode_state: &SessionModeState,
     goose_session: &Session,
+    model_config: Option<&crate::model::ModelConfig>,
 ) -> (SessionModelState, Vec<SessionConfigOption>) {
     let ms = build_model_state(current_model, inventory);
     let provider_selection = session_provider_selection(goose_session);
     let provider_options = build_provider_options(Some(provider_name)).await;
-    let config_options =
+    let mut config_options =
         build_config_options(mode_state, &ms, provider_selection, provider_options);
+    // Append thinking effort option when the current model supports reasoning.
+    if let Some(mc) = model_config {
+        if mc.is_reasoning_model() {
+            config_options.push(build_thinking_effort_option(mc));
+        }
+    }
     (ms, config_options)
 }
 
@@ -1159,6 +1166,39 @@ fn build_config_options(
         )
         .category(SessionConfigOptionCategory::Model),
     ]
+}
+
+/// Build a `SessionConfigOption` representing the current thinking effort level.
+///
+/// Uses the `ThoughtLevel` category so clients can identify it for UX placement.
+/// The available options mirror the `ThinkingEffort` enum variants.
+fn build_thinking_effort_option(model_config: &crate::model::ModelConfig) -> SessionConfigOption {
+    use crate::model::ThinkingEffort;
+
+    let current_effort = model_config
+        .thinking_effort()
+        .unwrap_or(ThinkingEffort::High);
+
+    let options: Vec<SessionConfigSelectOption> = [
+        (ThinkingEffort::Off, "Off", "No extended thinking"),
+        (ThinkingEffort::Low, "Low", "Faster responses, lighter reasoning"),
+        (ThinkingEffort::Medium, "Medium", "Balanced reasoning"),
+        (ThinkingEffort::High, "High", "Deep reasoning"),
+        (ThinkingEffort::Max, "Max", "Thorough, unconstrained thinking"),
+    ]
+    .into_iter()
+    .map(|(effort, name, desc)| {
+        SessionConfigSelectOption::new(effort.to_string(), name).description(desc)
+    })
+    .collect();
+
+    SessionConfigOption::select(
+        "thinking_effort",
+        "Thinking Effort",
+        current_effort.to_string(),
+        options,
+    )
+    .category(SessionConfigOptionCategory::ThoughtLevel)
 }
 
 fn to_nonnegative_u64(value: Option<i32>) -> Option<u64> {
@@ -1450,6 +1490,7 @@ impl GooseAcpAgent {
             &inventory,
             mode_state,
             goose_session,
+            Some(model_config),
         )
         .await;
         (Some(model_state), Some(config_options), prebuilt_provider)
@@ -3286,6 +3327,67 @@ impl GooseAcpAgent {
         Ok(SetSessionModelResponse::new())
     }
 
+    /// Handle `set_config_option` with `config_id = "thinking_effort"`.
+    ///
+    /// Updates the session's model config `request_params` with the new thinking effort
+    /// level, then recreates the provider so the change takes effect on the next prompt.
+    async fn on_set_thinking_effort(
+        &self,
+        session_id: &str,
+        effort: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        // Validate the effort value before applying it.
+        effort.parse::<crate::model::ThinkingEffort>().map_err(|e| {
+            agent_client_protocol::Error::invalid_params().data(e)
+        })?;
+
+        let config = self.config()?;
+        let agent = self.get_session_agent_provider_ready(session_id).await?;
+        let current_provider = agent
+            .provider()
+            .await
+            .internal_err_ctx("Failed to get provider")?;
+        let provider_name = current_provider.get_name().to_string();
+        let current_model_config = current_provider.get_model_config();
+
+        // Rebuild the model config with the new thinking effort in request_params.
+        let request_params = HashMap::from([(
+            "thinking_effort".to_string(),
+            serde_json::json!(effort),
+        )]);
+        let model_config = crate::model::ModelConfig::new(&current_model_config.model_name)
+            .invalid_params_err_ctx("Invalid model config")?
+            .with_canonical_limits(&provider_name)
+            .with_context_limit(current_model_config.context_limit);
+        let model_config = with_preserved_session_request_params(
+            model_config,
+            Some(&current_model_config),
+            Some(request_params),
+        );
+
+        let extensions =
+            EnabledExtensionsState::for_session(&self.session_manager, session_id, &config).await;
+        let session = self
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .internal_err_ctx("Failed to get session")?;
+        let provider = self
+            .create_provider(
+                &provider_name,
+                model_config,
+                extensions,
+                Some(session.working_dir),
+            )
+            .await
+            .internal_err_ctx("Failed to create provider")?;
+        agent
+            .update_provider(provider, session_id)
+            .await
+            .internal_err_ctx("Failed to update provider")?;
+        Ok(())
+    }
+
     async fn build_config_update(
         &self,
         session_id: &SessionId,
@@ -3301,7 +3403,8 @@ impl GooseAcpAgent {
             .await
             .internal_err_ctx("Failed to get provider")?;
         let provider_name = provider.get_name().to_string();
-        let current_model = provider.get_model_config().model_name.clone();
+        let model_config = provider.get_model_config();
+        let current_model = model_config.model_name.clone();
         let goose_mode = agent.goose_mode().await;
         let inventory = self
             .provider_inventory
@@ -3315,12 +3418,16 @@ impl GooseAcpAgent {
         let model_state = build_model_state(current_model.as_str(), &inventory);
         let mode_state = build_mode_state(goose_mode)?;
         let provider_options = build_provider_options(Some(&provider_name)).await;
-        let config_options = build_config_options(
+        let mut config_options = build_config_options(
             &mode_state,
             &model_state,
             session_provider_selection(&session),
             provider_options,
         );
+        // Append thinking effort option when the current model supports reasoning.
+        if model_config.is_reasoning_model() {
+            config_options.push(build_thinking_effort_option(&model_config));
+        }
         let notification = SessionNotification::new(
             session_id.clone(),
             SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(config_options.clone())),
